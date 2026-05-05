@@ -5,9 +5,9 @@ VMINSERT="http://localhost:8480/insert/0/prometheus"
 VMSELECT="http://localhost:8481/select/0/prometheus"
 
 write_metric() {
-  local metric=$1 value=$2
+  local metric=$1 value=$2 ts_ms=$3
   curl -s -o /dev/null -w "%{http_code}" -X POST "$VMINSERT/api/v1/import/prometheus" \
-    --data-binary "$metric $value"
+    --data-binary "$metric $value $ts_ms"
 }
 
 query_metric() {
@@ -49,16 +49,30 @@ wait_vmselect() {
 # Write a metric and poll until vmselect returns it — ensures vminsert is
 # fully connected to all vmstorage nodes before we proceed
 wait_for_metric() {
-  local metric=$1
+  local metric=$1 ts_ms=$2
   local attempts=0
   until [ "$(series_count "$(query_metric "$metric")")" -gt 0 ] 2>/dev/null; do
     # Re-send the write in case vminsert wasn't fully connected on first attempt
-    write_metric "$metric" 1.0 > /dev/null
+    write_metric "$metric" 1.0 "$ts_ms" > /dev/null
     sleep 1
     attempts=$((attempts + 1))
     if [ "$attempts" -gt 30 ]; then
       echo "ERROR: $metric never appeared — cluster not working end-to-end"
       docker compose logs vminsert
+      exit 1
+    fi
+  done
+}
+
+wait_for_value() {
+  local metric=$1 expected=$2 ts_ms=$3
+  local attempts=0
+  until [ "$(metric_value "$(query_metric "$metric")")" = "$expected" ] 2>/dev/null; do
+    write_metric "$metric" "$expected" "$ts_ms" > /dev/null
+    sleep 1
+    attempts=$((attempts + 1))
+    if [ "$attempts" -gt 30 ]; then
+      echo "ERROR: $metric never showed value=$expected"
       exit 1
     fi
   done
@@ -78,15 +92,22 @@ wait_vmselect
 
 # Confirm end-to-end write path is working before the test begins
 echo "         confirming end-to-end write path..."
-write_metric "vm_probe" 1.0 > /dev/null
-wait_for_metric "vm_probe"
+PROBE_MS=$(( ($(date +%s) - 10) * 1000 ))
+write_metric "vm_probe" 1.0 "$PROBE_MS" > /dev/null
+wait_for_metric "vm_probe" "$PROBE_MS"
 echo "         write path confirmed"
 echo ""
 
+# Use timestamps spaced 5 minutes apart so the query unambiguously
+# returns the most recent value regardless of dedup or lookback windows
+NOW_S=$(date +%s)
+T1_MS=$(( (NOW_S - 300) * 1000 ))   # 5 minutes ago — value=1
+T2_MS=$(( (NOW_S - 30) * 1000 ))    # 30 seconds ago — value=2
+
 # ---------------------------------------------------------------
 echo "[Step 1] Writing test_series=1 (all 3 nodes up)..."
-write_metric "test_series" 1.0 > /dev/null
-wait_for_metric "test_series"
+write_metric "test_series" 1.0 "$T1_MS" > /dev/null
+wait_for_metric "test_series" "$T1_MS"
 
 result1=$(query_metric "test_series")
 show_result "query 1 — all nodes up, value 1 written to all 3 nodes" "$result1"
@@ -101,15 +122,22 @@ echo ""
 
 # ---------------------------------------------------------------
 echo "[Step 3] Writing test_series=2 (only vmstorage-1 is up)..."
-status=$(write_metric "test_series" 2.0)
+status=$(write_metric "test_series" 2.0 "$T2_MS")
 echo "         vminsert HTTP status: $status  (accepted, RF not met, silently)"
-sleep 3  # wait for vminsert buffer to flush to vmstorage-1
+echo "         waiting for value=2 to appear on vmstorage-1..."
+wait_for_value "test_series" "2" "$T2_MS"
 echo ""
 
 # ---------------------------------------------------------------
-echo "[Step 4] Restarting vmstorage-2 and vmstorage-3, stopping vmstorage-1..."
+echo "[Step 4] Querying test_series with only vmstorage-1 up (proves value=2 was written)..."
+result_mid=$(query_metric "test_series")
+show_result "query — only vmstorage-1 up, value=2 should be visible" "$result_mid"
+echo ""
+
+# ---------------------------------------------------------------
+echo "[Step 5] Restarting vmstorage-2 and vmstorage-3, stopping vmstorage-1..."
 docker compose start vmstorage-2 vmstorage-3
-sleep 3  # wait for nodes to reconnect
+sleep 3  # wait for nodes to reconnect to vminsert/vmselect
 docker compose stop vmstorage-1
 sleep 2
 echo "         vmstorage-1 down  — has test_series=1 AND test_series=2"
@@ -125,9 +153,11 @@ divider
 echo " Results"
 divider
 echo ""
-show_result "query 1 — all nodes up" "$result1"
+show_result "query 1 — all nodes up, after writing value=1" "$result1"
 echo ""
-show_result "query 2 — vmstorage-1 down (only node with value=2)" "$result2"
+show_result "query 2 — only vmstorage-1 up, after writing value=2 (proves write succeeded)" "$result_mid"
+echo ""
+show_result "query 3 — vmstorage-1 down, nodes 2+3 up (never received value=2)" "$result2"
 echo ""
 
 ip=$(is_partial "$result2")
@@ -149,8 +179,8 @@ divider
 if [ "$ip" = "False" ] && [ "$is_stale" = "stale" ]; then
   echo " BUG CONFIRMED"
   echo ""
-  echo "  last write : value=2  (written to vmstorage-1 only, now down)"
-  echo "  query 2    : value=$val  isPartial=False"
+  echo "  query 2 proved value=2 was written and visible on vmstorage-1"
+  echo "  query 3 returned value=$val  isPartial=False  (should be value=2)"
   echo ""
   echo "  vmselect sees 1 node down — below RF=3 — assumes all copies present."
   echo "  Nodes 2+3 only received the value=1 write. vmselect returns stale"

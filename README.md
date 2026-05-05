@@ -1,7 +1,7 @@
 # VictoriaMetrics `isPartial` Correctness Bug
 
 This test demonstrates that VictoriaMetrics cluster can return `isPartial=false`
-(claiming a query result is complete) when data is silently missing.
+(claiming a query result is complete) when the data returned is silently stale.
 
 ## Background
 
@@ -13,8 +13,8 @@ trusting that the remaining nodes have complete data.
 The bug: **vminsert does not guarantee writes reach RF nodes**. If some nodes are
 unavailable during a write, vminsert accepts partial replication silently and returns
 HTTP 204 to the caller. vmselect has no record of this. On a subsequent query, if the
-node that holds the only copy is down but total failures are below the RF threshold,
-vmselect returns `isPartial=false` with missing data — no error, no warning.
+node that holds the most recent write is down but total failures are below the RF
+threshold, vmselect returns `isPartial=false` with stale data — no error, no warning.
 
 ### Relevant code
 
@@ -44,6 +44,10 @@ if failedGroups < *globalReplicationFactor {
 These two halves share no state. vmselect's correctness assumption is never verified
 against what vminsert actually achieved.
 
+## Requirements
+
+Docker, Docker Compose, Python 3, curl
+
 ## Running the test
 
 ```bash
@@ -56,63 +60,14 @@ chmod +x test.sh
 
 1. Starts a 3-node cluster with RF=3
 2. **Writes `test_series=1`** with all nodes up — all 3 nodes receive it
-3. **Queries `test_series`** — `isPartial=false`, `value=1` *(correct)*
+3. **Query 1**: `isPartial=false`, `value=1` *(correct)*
 4. Stops vmstorage-2 and vmstorage-3 — only vmstorage-1 is available
 5. **Writes `test_series=2`** — vminsert accepts the write (HTTP 204), but only
    vmstorage-1 receives it (1 of 3 copies, RF not met, silently)
-6. Restarts vmstorage-2 and vmstorage-3, then stops vmstorage-1 — the only node
-   with the `value=2` write is now down; nodes 2+3 are up with stale `value=1` data
-7. **Queries `test_series`** — `isPartial=false`, `value=1` *(bug — stale data returned
-   as if complete; last write was value=2)*
-
-## Expected output
-
-```
-=================================================================
- VictoriaMetrics isPartial Correctness Bug
- RF=3, 3 vmstorage nodes
-=================================================================
-
-[Step 1] Writing test_series=1 (all 3 nodes up)...
-  [query 1 — all nodes up, value 1 written to all 3 nodes]
-    isPartial : False
-    value     : 1
-
-[Step 2] Stopping vmstorage-2 and vmstorage-3...
-         only vmstorage-1 is available
-
-[Step 3] Writing test_series=2 (only vmstorage-1 is up)...
-         vminsert HTTP status: 204  (accepted, RF not met, silently)
-
-[Step 4] Restarting vmstorage-2 and vmstorage-3, stopping vmstorage-1...
-         vmstorage-1 down  — has test_series=1 AND test_series=2
-         vmstorage-2 up    — has test_series=1 only
-         vmstorage-3 up    — has test_series=1 only
-         1 node down, 2/3 responding — below RF=3 failure threshold
-
-=================================================================
- Results
-=================================================================
-
-  [query 1 — all nodes up]
-    isPartial : False
-    value     : 1
-
-  [query 2 — vmstorage-1 down (only node with value=2)]
-    isPartial : False
-    value     : 1
-
-=================================================================
- BUG CONFIRMED
-
-  last write : value=2  (written to vmstorage-1 only, now down)
-  query 2    : value=1  isPartial=False
-
-  vmselect sees 1 node down — below RF=3 — assumes all copies present.
-  Nodes 2+3 only received the value=1 write. vmselect returns stale
-  data with no warning, no partial flag, no indication anything is wrong.
-=================================================================
-```
+6. **Query 2**: `isPartial=false`, `value=2` *(correct — proves the write reached vmstorage-1)*
+7. Restarts vmstorage-2 and vmstorage-3, then stops vmstorage-1 — the only node
+   with the `value=2` write is now down; nodes 2+3 are up with only the stale `value=1` data
+8. **Query 3**: `isPartial=false`, `value=1` *(bug — stale data returned as complete; last acknowledged write was value=2)*
 
 ## Why this matters operationally
 
@@ -121,10 +76,13 @@ even one write to miss a replica:
 
 - **Rolling restarts / rollouts**: nodes cycle through unavailability sequentially.
   Each restart creates a window where writes are under-replicated. If a later
-  restart takes down the node holding those writes, results are silently incomplete.
+  restart takes down the node holding those writes, subsequent queries return stale
+  data with `isPartial=false`.
 - **Brief network partitions**: a momentary blip causes vminsert to skip a node.
-  The write succeeds, the gap persists until retention expires.
-- **Node overload**: a slow node causes vminsert to time out and skip it.
+  The write succeeds, the data gap persists until retention expires.
+- **Node overload**: a slow node causes vminsert to skip it and accept incomplete
+  replication.
 
 In all cases, downstream systems (dashboards, alerting, recording rules) receive
-`isPartial=false` responses with missing data and no indication anything is wrong.
+`isPartial=false` responses with stale or missing data and no indication anything
+is wrong.
