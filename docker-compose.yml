@@ -1,0 +1,55 @@
+services:
+  vmstorage-1:
+    image: victoriametrics/vmstorage:v1.142.0-cluster
+    volumes:
+      - strgdata-1:/storage
+    command:
+      - "--storageDataPath=/storage"
+
+  vmstorage-2:
+    image: victoriametrics/vmstorage:v1.142.0-cluster
+    volumes:
+      - strgdata-2:/storage
+    command:
+      - "--storageDataPath=/storage"
+
+  vmstorage-3:
+    image: victoriametrics/vmstorage:v1.142.0-cluster
+    volumes:
+      - strgdata-3:/storage
+    command:
+      - "--storageDataPath=/storage"
+
+  vminsert:
+    image: victoriametrics/vminsert:v1.142.0-cluster
+    ports:
+      - "8480:8480"
+    command:
+      - "--storageNode=vmstorage-1:8400"
+      - "--storageNode=vmstorage-2:8400"
+      - "--storageNode=vmstorage-3:8400"
+      - "--replicationFactor=3"
+    depends_on:
+      - vmstorage-1
+      - vmstorage-2
+      - vmstorage-3
+
+  vmselect:
+    image: victoriametrics/vmselect:v1.142.0-cluster
+    ports:
+      - "8481:8481"
+    command:
+      - "--storageNode=vmstorage-1:8401"
+      - "--storageNode=vmstorage-2:8401"
+      - "--storageNode=vmstorage-3:8401"
+      - "--replicationFactor=3"
+      - "--dedup.minScrapeInterval=1ms"
+    depends_on:
+      - vmstorage-1
+      - vmstorage-2
+      - vmstorage-3
+
+volumes:
+  strgdata-1: {}
+  strgdata-2: {}
+  strgdata-3: {}
