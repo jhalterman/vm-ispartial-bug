@@ -16,34 +16,6 @@ HTTP 204 to the caller. vmselect has no record of this. On a subsequent query, i
 node that holds the most recent write is down but total failures are below the RF
 threshold, vmselect returns `isPartial=false` with stale data — no error, no warning.
 
-### Relevant code
-
-vminsert accepts incomplete replication as success
-(`app/vminsert/netstorage/netstorage.go`):
-
-```go
-// The data is partially replicated, so just emit a warning and return true.
-// We could retry sending the data again, but this may result in uncontrolled duplicate data.
-// So it is better returning true.
-rowsIncompletelyReplicatedTotal.Add(br.rows)
-incompleteReplicationLogger.Warnf("cannot make a copy #%d out of %d copies...")
-return true  // write considered successful
-```
-
-vmselect assumes RF copies exist based on a node count threshold
-(`app/vmselect/netstorage/netstorage.go`):
-
-```go
-// Assume that the result is full if the number of failed groups
-// is smaller than the globalReplicationFactor.
-if failedGroups < *globalReplicationFactor {
-    return false, nil  // isPartial=false
-}
-```
-
-These two halves share no state. vmselect's correctness assumption is never verified
-against what vminsert actually achieved.
-
 ## Requirements
 
 Docker, Docker Compose, Python 3, curl
@@ -51,8 +23,6 @@ Docker, Docker Compose, Python 3, curl
 ## Running the test
 
 ```bash
-cd vm-ispartial-bug
-chmod +x test.sh
 ./test.sh
 ```
 
